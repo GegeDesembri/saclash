@@ -1,0 +1,96 @@
+#!/bin/bash /etc/rc.common
+
+START=96
+STOP=50
+
+# Parameters
+export profile="default"
+export workdir="$(uci get saclash.${profile}.workdir)"
+export coredir="${workdir}/core"
+export configdir="${workdir}/config"
+export name_config="$(uci get saclash.${profile}.config)"
+export clash_core="${coredir}/$(uci get saclash.${profile}.core)"
+export boot_delay="$(uci get saclash.${profile}.boot_delay)"
+export after_delay="$(uci get saclash.${profile}.after_delay)"
+export watchdog_delay="$(uci get saclash.${profile}.watchdog_delay)"
+mkdir -p ${workdir}
+mkdir -p ${coredir}
+mkdir -p ${configdir}
+
+function check_gw(){
+    ping -q -w 1 -c 1 $1 > /dev/null && echo ok || echo error
+}
+
+function saclash_watchdog(){
+    while true; do
+        cat ${configdir}/${name_config} | yq -r '.proxies[] | [.server, .gateway] | @csv' | while read route_obj; do
+            ipserver="$(echo -e "${route_obj}" | cut -d ',' -f 1)"
+            gateway="$(echo -e "${route_obj}" | cut -d ',' -f 2)"
+            
+            if [[ $(ip route | grep -wce "${ipserver}") -eq 0 ]]; then
+                echo -e "Re-routing ${ipserver} gateway ${gateway}"
+                route add ${ipserver} gw ${gateway} &>/dev/null
+            else
+                echo -e "${ipserver} gateway ${gateway} routed"
+            fi
+        done
+        sleep ${watchdog_delay}
+    done
+}
+
+start(){
+    # Boot Delay
+    echo -e "Delay ${boot_delay} secs"
+    sleep ${boot_delay}
+    
+    # Set Route
+    cat ${configdir}/${name_config} | yq -r '.proxies[] | [.server, .gateway] | @csv' | while read route_obj; do
+        ipserver="$(echo -e "${route_obj}" | cut -d ',' -f 1)"
+        gateway="$(echo -e "${route_obj}" | cut -d ',' -f 2)"
+        if [[ "$(check_gw ${gateway})" == "ok" ]]; then
+            echo -e "Route ${ipserver} via ${gateway}"
+            route add ${ipserver} gw ${gateway} &>/dev/null
+            echo -e "online" > /tmp/clash_gateway
+        else
+            echo -e "Gateway ${gateway} is offline"
+            echo -e "offline" > /tmp/clash_gateway
+            exit 1
+        fi
+    done
+
+    # Run Clash
+    screen -dmS saclash ${clash_core} -d ${workdir} -f ${configdir}/${name_config}
+    sleep ${after_delay}
+    
+    # Remove default route
+    cat ${configdir}/${name_config} | yq -r '.proxies[] | [.server, .gateway] | @csv' | while read route_obj; do
+        ipserver="$(echo -e "${route_obj}" | cut -d ',' -f 1)"
+        gateway="$(echo -e "${route_obj}" | cut -d ',' -f 2)"
+        echo -e "Remove Route default via ${gateway}"
+        route del default gw ${gateway} &>/dev/null
+    done
+    
+    # Run Watchdog
+    export -f saclash_watchdog
+    screen -dmS saclash_watchdog bash -c "saclash_watchdog"
+}
+
+stop(){
+    echo -e "Deleting Previous route"
+    cat ${configdir}/${name_config} | yq -r '.proxies[] | [.server, .gateway] | @csv' | while read route_obj; do
+        ipserver="$(echo -e "${route_obj}" | cut -d ',' -f 1)"
+        gateway="$(echo -e "${route_obj}" | cut -d ',' -f 2)"
+        route del ${ipserver} gw ${gateway} &>/dev/null
+    done
+    echo -e "Stopping Clash"
+    clash_pid="$(screen -ls | grep -oE "[0-9]+\.saclash\t" | sed -e "s/\..*$//g")"
+    if [[ ! "${clash_pid}" == '' ]]; then
+        kill ${clash_pid}
+    fi
+    echo -e "Stopping Clash Watchdog"
+    watchdog_pid="$(screen -ls | grep -oE "[0-9]+\.saclash_watchdog\t" | sed -e "s/\..*$//g")"
+    if [[ ! "${watchdog_pid}" == '' ]]; then
+        kill ${watchdog_pid}
+    fi
+    echo -e "Clash Stopped"
+}
